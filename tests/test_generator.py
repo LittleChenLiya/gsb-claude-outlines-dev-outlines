@@ -69,7 +69,15 @@ def steerable_model():
 
 @pytest.fixture(scope="session")
 def sample_processor():
-    vocabulary = Vocabulary.from_pretrained("openai-community/gpt2")
+    # Use a mock vocabulary to avoid network access when downloading the
+    # GPT-2 tokenizer is not possible.
+    vocabulary = Vocabulary(0, {})
+    for i, token in enumerate(
+        list("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+        + [" ", "{", "}", '"', ":", ",", "[", "]", ".", "-", "_", "+", "=",
+           "!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "\n", "\t"]
+    ):
+        vocabulary.insert(token, i + 1)
     index = Index(r"[0-9]{3}", vocabulary)
     return OutlinesCoreLogitsProcessor(index, "torch")
 

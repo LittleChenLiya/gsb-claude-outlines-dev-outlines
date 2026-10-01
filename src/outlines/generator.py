@@ -1,28 +1,142 @@
 """Encapsulate a model and an output type into a reusable object."""
 
+import json
 from typing import (
     Any,
     AsyncIterator,
     Iterator,
     List,
     Optional,
+    Tuple,
     Union,
 )
 
-from outlines.models import (
-    AsyncBlackBoxModel,
-    BlackBoxModel,
-    SteerableModel,
-)
-from outlines.models.base import AsyncModel, Model
 from outlines.backends import (
     get_cfg_logits_processor,
     get_json_schema_logits_processor,
     get_regex_logits_processor,
 )
 from outlines.backends.base import LogitsProcessorType
+from outlines.exceptions import StructuredGenerationError
+from outlines.models import (
+    AsyncBlackBoxModel,
+    BlackBoxModel,
+    SteerableModel,
+)
+from outlines.models.base import AsyncModel, Model
 from outlines.types import CFG, JsonSchema
 from outlines.types.dsl import python_types_to_terms, to_regex
+from outlines.types.utils import is_native_dict
+
+
+def _is_valid_json_prefix(s: str) -> Tuple[bool, int]:
+    """Check whether *s* is a valid prefix of a JSON value.
+
+    A string is a valid prefix if it is empty, a complete JSON value, or can be
+    extended to a complete JSON value by appending more characters.
+
+    Parameters
+    ----------
+    s
+        The string to check.
+
+    Returns
+    -------
+    Tuple[bool, int]
+        ``(True, len(s))`` if *s* is a valid prefix, ``(False, pos)`` otherwise
+        where *pos* is the position at which the first invalid character was
+        encountered.
+
+    """
+    if not s:
+        return (True, 0)
+
+    try:
+        json.loads(s)
+        return (True, len(s))
+    except json.JSONDecodeError as exc:
+        # An unterminated string literal (e.g. '"abc') is not closed yet, but
+        # it can still be completed by appending more characters, so it is a
+        # valid prefix.
+        if exc.msg.startswith("Unterminated string"):
+            return (True, len(s))
+        # An error at or beyond the end of the input means the value is simply
+        # incomplete (e.g. '{"a": 1'), not invalid.
+        if exc.pos >= len(s):
+            return (True, len(s))
+        return (False, exc.pos)
+
+
+def _verify_json_stream(stream: Iterator[str]) -> Iterator[str]:
+    """Wrap *stream* so that the accumulated output always forms a valid JSON
+    prefix.
+
+    Yields each chunk as it is received. Raises
+    :class:`~outlines.exceptions.StructuredGenerationError` if the accumulated
+    output ceases to be a valid prefix (the model emitted an invalid character)
+    or if the stream ends before the output is a complete JSON value.
+
+    Parameters
+    ----------
+    stream
+        The raw stream of text chunks from the model.
+
+    Yields
+    ------
+    str
+        The chunks from *stream*, unchanged.
+
+    """
+    accumulated = ""
+    for chunk in stream:
+        accumulated += chunk
+        is_valid, pos = _is_valid_json_prefix(accumulated)
+        if not is_valid:
+            raise StructuredGenerationError(
+                verified_prefix=accumulated[:pos],
+                failure_position=pos,
+                reason="invalid",
+            )
+        yield chunk
+
+    if accumulated:
+        try:
+            json.loads(accumulated)
+        except json.JSONDecodeError:
+            is_valid, pos = _is_valid_json_prefix(accumulated)
+            raise StructuredGenerationError(
+                verified_prefix=accumulated[:pos],
+                failure_position=pos,
+                reason="incomplete",
+            )
+
+
+async def _verify_json_stream_async(
+    stream: AsyncIterator[str],
+) -> AsyncIterator[str]:
+    """Async counterpart of :func:`_verify_json_stream`."""
+    accumulated = ""
+    async for chunk in stream:
+        accumulated += chunk
+        is_valid, pos = _is_valid_json_prefix(accumulated)
+        if not is_valid:
+            raise StructuredGenerationError(
+                verified_prefix=accumulated[:pos],
+                failure_position=pos,
+                reason="invalid",
+            )
+        yield chunk
+
+    if accumulated:
+        try:
+            json.loads(accumulated)
+        except json.JSONDecodeError:
+            is_valid, pos = _is_valid_json_prefix(accumulated)
+            raise StructuredGenerationError(
+                verified_prefix=accumulated[:pos],
+                failure_position=pos,
+                reason="incomplete",
+            )
 
 
 class BlackBoxGenerator:
@@ -48,6 +162,44 @@ class BlackBoxGenerator:
         self.model = model
         self.output_type = output_type
 
+    def _is_json_output_type(self) -> bool:
+        """Return ``True`` if the output type is a JSON type."""
+        if self.output_type is None:
+            return False
+        return JsonSchema.is_json_schema(self.output_type) or is_native_dict(
+            self.output_type
+        )
+
+    def _verify_json_result(self, result: Any) -> None:
+        """Verify that *result* is a complete JSON value.
+
+        Raises
+        ------
+        StructuredGenerationError
+            If *result* is not a complete JSON value.
+
+        """
+        if isinstance(result, list):
+            for item in result:
+                self._verify_json_result(item)
+            return
+
+        is_valid, pos = _is_valid_json_prefix(result)
+        if not is_valid:
+            raise StructuredGenerationError(
+                verified_prefix=result[:pos],
+                failure_position=pos,
+                reason="invalid",
+            )
+        try:
+            json.loads(result)
+        except json.JSONDecodeError:
+            raise StructuredGenerationError(
+                verified_prefix=result[:pos],
+                failure_position=pos,
+                reason="incomplete",
+            )
+
     def __call__(self, prompt: Any, **inference_kwargs) -> Any:
         """Generate a response from the model.
 
@@ -64,9 +216,12 @@ class BlackBoxGenerator:
             The response generated by the model.
 
         """
-        return self.model.generate(
+        result = self.model.generate(
             prompt, self.output_type, **inference_kwargs
         )
+        if self._is_json_output_type():
+            self._verify_json_result(result)
+        return result
 
     def batch(self, prompts: List[Any], **inference_kwargs) -> List[Any]:
         """Generate a batch of responses from the model.
@@ -84,9 +239,13 @@ class BlackBoxGenerator:
             The list of responses generated by the model.
 
         """
-        return self.model.generate_batch(
+        results = self.model.generate_batch(
             prompts, self.output_type, **inference_kwargs
         )
+        if self._is_json_output_type():
+            for result in results:
+                self._verify_json_result(result)
+        return results
 
     def stream(self, prompt: Any, **inference_kwargs) -> Iterator[Any]:
         """Generate a stream of responses from the model.
@@ -104,9 +263,12 @@ class BlackBoxGenerator:
             The response generated by the model.
 
         """
-        return self.model.generate_stream(
+        stream = self.model.generate_stream(
             prompt, self.output_type, **inference_kwargs
         )
+        if self._is_json_output_type():
+            return _verify_json_stream(stream)
+        return stream
 
 
 class AsyncBlackBoxGenerator:
@@ -132,6 +294,44 @@ class AsyncBlackBoxGenerator:
         self.model = model
         self.output_type = output_type
 
+    def _is_json_output_type(self) -> bool:
+        """Return ``True`` if the output type is a JSON type."""
+        if self.output_type is None:
+            return False
+        return JsonSchema.is_json_schema(self.output_type) or is_native_dict(
+            self.output_type
+        )
+
+    def _verify_json_result(self, result: Any) -> None:
+        """Verify that *result* is a complete JSON value.
+
+        Raises
+        ------
+        StructuredGenerationError
+            If *result* is not a complete JSON value.
+
+        """
+        if isinstance(result, list):
+            for item in result:
+                self._verify_json_result(item)
+            return
+
+        is_valid, pos = _is_valid_json_prefix(result)
+        if not is_valid:
+            raise StructuredGenerationError(
+                verified_prefix=result[:pos],
+                failure_position=pos,
+                reason="invalid",
+            )
+        try:
+            json.loads(result)
+        except json.JSONDecodeError:
+            raise StructuredGenerationError(
+                verified_prefix=result[:pos],
+                failure_position=pos,
+                reason="incomplete",
+            )
+
     async def __call__(self, prompt: Any, **inference_kwargs) -> Any:
         """Generate a response from the model.
 
@@ -148,9 +348,12 @@ class AsyncBlackBoxGenerator:
             The response generated by the model.
 
         """
-        return await self.model.generate(
+        result = await self.model.generate(
             prompt, self.output_type, **inference_kwargs
         )
+        if self._is_json_output_type():
+            self._verify_json_result(result)
+        return result
 
     async def batch(self, prompts: List[Any], **inference_kwargs) -> List[Any]:
         """Generate a batch of responses from the model.
@@ -168,9 +371,13 @@ class AsyncBlackBoxGenerator:
             The list of responses generated by the model.
 
         """
-        return await self.model.generate_batch(
+        results = await self.model.generate_batch(
             prompts, self.output_type, **inference_kwargs
         )
+        if self._is_json_output_type():
+            for result in results:
+                self._verify_json_result(result)
+        return results
 
     async def stream(self, prompt: Any, **inference_kwargs) -> AsyncIterator[Any]:
         """Generate a stream of responses from the model.
@@ -188,10 +395,15 @@ class AsyncBlackBoxGenerator:
             The response generated by the model.
 
         """
-        async for chunk in self.model.generate_stream(  # pragma: no cover
+        stream = self.model.generate_stream(  # pragma: no cover
             prompt, self.output_type, **inference_kwargs
-        ):
-            yield chunk
+        )
+        if self._is_json_output_type():
+            async for chunk in _verify_json_stream_async(stream):
+                yield chunk
+        else:
+            async for chunk in stream:
+                yield chunk
 
 
 class SteerableGenerator:

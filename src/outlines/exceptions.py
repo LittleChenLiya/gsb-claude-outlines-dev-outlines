@@ -24,6 +24,7 @@ __all__ = [
     "APIConnectionError",
     "ProviderResponseError",
     "GenerationError",
+    "StructuredGenerationError",
     "is_provider_exception",
     "normalize_provider_errors",
     "normalize_provider_exception",
@@ -165,6 +166,60 @@ class ProviderResponseError(APIError):
 class GenerationError(APIError):
     """Content filter hit, length stop, or refusal."""
     hint = "Output was refused, hit a content filter, reached the model's max-token limit, or similar."
+
+
+class StructuredGenerationError(GenerationError):
+    """Structured output generation failed to produce a valid value.
+
+    Raised when a structured (e.g. JSON) generation cannot be completed: either
+    the model emitted a character that makes the value invalid, or the stream
+    ended before the value was complete. The verified prefix (the part of the
+    output that was successfully parsed as a valid prefix of the expected
+    structured value) and the position at which the failure was detected are
+    reported so callers can distinguish a partial-but-valid result from an
+    unverified suffix.
+
+    Attributes
+    ----------
+    verified_prefix : str
+        The longest prefix of the generated output that was verified as a valid
+        prefix of the expected structured value.
+    verified_prefix_length : int
+        Length of :attr:`verified_prefix`.
+    failure_position : int
+        The position in the generated output at which the failure was detected.
+        For an invalid character this is the index of that character; for an
+        incomplete generation (stream ended early) this is the length of the
+        output.
+    reason : str
+        ``"invalid"`` if the model emitted an invalid character, ``"incomplete"``
+        if the stream ended before the value was complete.
+    """
+
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        verified_prefix: str = "",
+        failure_position: int = 0,
+        reason: str = "invalid",
+        provider: str | None = None,
+        original_exception: Exception | None = None,
+    ):
+        if message is None:
+            message = (
+                f"Structured generation failed at position {failure_position} "
+                f"(verified prefix length {len(verified_prefix)}): {reason}"
+            )
+        super().__init__(
+            message,
+            provider=provider,
+            original_exception=original_exception,
+        )
+        self.verified_prefix = verified_prefix
+        self.verified_prefix_length = len(verified_prefix)
+        self.failure_position = failure_position
+        self.reason = reason
 
 
 # ---------------------------------------------------------------------------
