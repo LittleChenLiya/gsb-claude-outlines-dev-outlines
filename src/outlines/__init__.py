@@ -7,9 +7,19 @@ from outlines import models as models
 from outlines import processors as processors
 from outlines import types as types
 from outlines.applications import Application as Application
+from outlines.caching import (
+    bump_constraint_cache_generation as bump_constraint_cache_generation,
+)
 from outlines.caching import clear_cache as clear_cache
+from outlines.caching import constraint_cache as constraint_cache
 from outlines.caching import disable_cache as disable_cache
 from outlines.caching import get_cache as get_cache
+from outlines.caching import (
+    get_constraint_cache_generation as get_constraint_cache_generation,
+)
+from outlines.caching import (
+    reset_constraint_cache_generation as reset_constraint_cache_generation,
+)
 from outlines.generator import Generator as Generator
 from outlines.inputs import Audio as Audio
 from outlines.inputs import Image as Image
