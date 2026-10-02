@@ -1,6 +1,7 @@
 """Backend class for Outlines Core."""
 
-from typing import Callable, Dict, List
+import hashlib
+from typing import Any, Callable, Dict, List, Optional
 
 from outlines_core import Guide, Index, Vocabulary
 from outlines_core.json_schema import build_regex_from_schema
@@ -15,11 +16,23 @@ from outlines.processors.base_logits_processor import (
     TensorType,
 )
 
+SNAPSHOT_FORMAT_VERSION = "outlines-core-state-v1"
+
+
+def _grammar_fingerprint(grammar: str) -> str:
+    """Compute a stable fingerprint for a grammar (regex) string."""
+    return hashlib.sha256(grammar.encode("utf-8")).hexdigest()
+
 
 class OutlinesCoreLogitsProcessor(OutlinesLogitsProcessor):
     """Logits processor for Outlines Core."""
 
-    def __init__(self, index: Index, tensor_library_name: str):
+    def __init__(
+        self,
+        index: Index,
+        tensor_library_name: str,
+        grammar: Optional[str] = None,
+    ):
         """
         Parameters
         ----------
@@ -28,16 +41,123 @@ class OutlinesCoreLogitsProcessor(OutlinesLogitsProcessor):
             Core `Guide` instances that will be used to bias the logits
         tensor_library_name: str
             The tensor library name to use for the logits processor.
+        grammar: str | None
+            The grammar (regex) the `index` was built from. It is used to
+            fingerprint state snapshots so that a snapshot cannot be
+            restored into a processor that enforces a different grammar.
 
         """
         self.index = index
         self.tensor_library_name = tensor_library_name
+        self.grammar_fingerprint = (
+            _grammar_fingerprint(grammar) if grammar is not None else None
+        )
         self.is_first_token = True
+        self._token_histories: Optional[List[List[int]]] = None
+        self._pending_restore: Optional[List[List[int]]] = None
+        self._restored = False
         super().__init__(tensor_library_name)
 
     def reset(self) -> None:
         """Reset the logits processor."""
         self.is_first_token = True
+        self._token_histories = None
+        self._pending_restore = None
+        self._restored = False
+
+    def get_state_snapshot(self) -> Dict[str, Any]:
+        """Return a serializable snapshot of the current parsing state.
+
+        The snapshot is a plain dictionary of JSON-serializable values. It
+        can be stored or transmitted and later passed to
+        `load_state_snapshot` of a processor built for the same grammar to
+        resume incremental parsing of the same request.
+
+        Returns
+        -------
+        Dict[str, Any]
+            The state snapshot.
+
+        """
+        return {
+            "format": SNAPSHOT_FORMAT_VERSION,
+            "grammar_fingerprint": self.grammar_fingerprint,
+            "sequences": (
+                [list(history) for history in self._token_histories]
+                if self._token_histories is not None
+                else []
+            ),
+        }
+
+    def load_state_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        """Restore the parsing state from a snapshot.
+
+        The snapshot must have been created by `get_state_snapshot` on a
+        processor enforcing the same grammar, otherwise a `ValueError` is
+        raised. After loading, the next calls to `process_logits` behave as
+        if the tokens recorded in the snapshot had already been processed.
+
+        Parameters
+        ----------
+        snapshot: Dict[str, Any]
+            The snapshot to restore, as returned by `get_state_snapshot`.
+
+        """
+        if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("format") != SNAPSHOT_FORMAT_VERSION
+        ):
+            raise ValueError(
+                "Invalid state snapshot: expected a dictionary with "
+                f"'format' equal to {SNAPSHOT_FORMAT_VERSION!r}."
+            )
+        if (
+            self.grammar_fingerprint is None
+            or snapshot.get("grammar_fingerprint") != self.grammar_fingerprint
+        ):
+            raise ValueError(
+                "State snapshot was created for a different grammar and "
+                "cannot be restored into this processor."
+            )
+        sequences = snapshot.get("sequences")
+        if not isinstance(sequences, list) or not all(
+            isinstance(seq, list) and all(isinstance(t, int) for t in seq)
+            for seq in sequences
+        ):
+            raise ValueError(
+                "Invalid state snapshot: 'sequences' must be a list of "
+                "lists of token ids."
+            )
+
+        if not sequences:
+            # Snapshot of a processor that has not processed anything yet:
+            # restoring it is equivalent to a fresh start.
+            self._pending_restore = None
+            self._restored = False
+            return
+        self._pending_restore = [list(seq) for seq in sequences]
+        self._restored = True
+        if self._token_histories is not None:
+            # The processor is already set up: apply the snapshot now.
+            self._apply_pending_restore(len(self._token_histories))
+
+    def _apply_pending_restore(self, batch_size: int) -> None:
+        """Replay the token histories of a loaded snapshot on the guides."""
+        histories = self._pending_restore
+        if histories is None:
+            return
+        if len(histories) != batch_size:
+            raise ValueError(
+                f"State snapshot contains {len(histories)} sequence(s) but "
+                f"the current batch size is {batch_size}."
+            )
+        self._token_histories = []
+        for i, history in enumerate(histories):
+            self._guides[i].reset()
+            for token_id in history:
+                self._guides[i].advance(token_id=token_id, return_tokens=False)
+            self._token_histories.append(list(history))
+        self._pending_restore = None
 
     def _setup(self, batch_size: int, vocab_size: int) -> None:
         """Set the guides, bitmasks and some functions used in the
@@ -80,6 +200,8 @@ class OutlinesCoreLogitsProcessor(OutlinesLogitsProcessor):
         self._bitmasks = [
             self.allocate_token_bitmask(vocab_size) for _ in range(batch_size)
         ]
+        self._token_histories = [[] for _ in range(batch_size)]
+        self._apply_pending_restore(batch_size)
 
     def _bias_logits_mlx(  # pragma: no cover
         self, batch_size: int, logits: TensorType
@@ -159,7 +281,14 @@ class OutlinesCoreLogitsProcessor(OutlinesLogitsProcessor):
         if self.is_first_token:
             self._setup(batch_size, vocab_size)
             self.is_first_token = False
+            # A processor restored from a snapshot continues an existing
+            # sequence, so the last token of `input_ids` must be advanced
+            # like for any subsequent call.
+            should_advance = self._restored
         else:
+            should_advance = True
+
+        if should_advance:
             for i in range(batch_size):
                 last_token_id = self.tensor_adapter.to_scalar(input_ids[i][-1])  # type: ignore
                 # This circumvents issue #227 in outlines_core
@@ -169,6 +298,7 @@ class OutlinesCoreLogitsProcessor(OutlinesLogitsProcessor):
                     [last_token_id]
                 ):
                     self._guides[i].advance(token_id=last_token_id, return_tokens=False)
+                    self._token_histories[i].append(last_token_id)  # type: ignore
 
         return self.bias_logits(batch_size, logits)
 
@@ -248,7 +378,7 @@ class OutlinesCoreBackend(BaseBackend):
 
         """
         index = Index(regex, self.vocabulary)
-        return OutlinesCoreLogitsProcessor(index, self.tensor_library_name)
+        return OutlinesCoreLogitsProcessor(index, self.tensor_library_name, regex)
 
     def get_cfg_logits_processor(self, grammar):
         raise NotImplementedError(
