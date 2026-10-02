@@ -5,6 +5,7 @@ import contextlib
 import functools
 import os
 import tempfile
+import threading
 from typing import Callable, Optional
 
 import cloudpickle
@@ -193,3 +194,100 @@ def cache_disabled():
         yield
     finally:
         _caching_enabled = original_state
+
+
+class ConstraintCache:
+    """Cache compiled constraints with a configuration generation.
+
+    A constraint compiler turns a high-level constraint (a regex, a JSON
+    schema, a context-free grammar, ...) into a compiled object that is
+    expensive to build. This cache memoizes those compiled objects.
+
+    Every cache key includes a *configuration generation*. When the
+    configuration changes (a new model, a different tokenizer, ...) call
+    :meth:`bump_generation`; the generation is part of every key so entries
+    compiled under an older generation never match again. Old entries are
+    not deleted, they simply stop matching.
+
+    Concurrency
+    -----------
+    Concurrent calls with the same key only compile once. The first call
+    compiles while the others wait on a per-key lock and then reuse the
+    compiled result.
+
+    Failures
+    --------
+    A compilation that raises is never cached: the exception propagates to
+    the caller and the next call retries the compilation.
+    """
+
+    _GENERATION_KEY = "__constraint_generation__"
+
+    def __init__(self, memory: Optional[Cache] = None):
+        self.memory = memory if memory is not None else get_cache()
+        self._generation = self.memory.get(self._GENERATION_KEY, 0)
+        self._locks: dict = {}
+        self._locks_guard = threading.Lock()
+
+    @property
+    def generation(self) -> int:
+        """The current configuration generation."""
+        return self._generation
+
+    def bump_generation(self) -> int:
+        """Advance the configuration generation.
+
+        Returns the new generation. Old cache entries no longer match
+        because the generation is part of every cache key.
+        """
+        with self._locks_guard:
+            self._generation += 1
+            self.memory.set(self._GENERATION_KEY, self._generation)
+        return self._generation
+
+    def _make_key(self, compiler: Callable, constraint, *args, **kwargs):
+        if hasattr(compiler, "__qualname__"):
+            name = full_name(compiler)
+        else:
+            # callable instance: identify it by its class
+            name = full_name(type(compiler))
+        base = (name,)
+        return args_to_key(base, (constraint,) + args, kwargs, False, ())
+
+    def compile(self, compiler: Callable, constraint, *args, **kwargs):
+        """Compile ``constraint`` with ``compiler``, caching the result.
+
+        The compiler is called as ``compiler(constraint, *args, **kwargs)``.
+        """
+        if not _caching_enabled:
+            return compiler(constraint, *args, **kwargs)
+
+        base_key = self._make_key(compiler, constraint, *args, **kwargs)
+        key = base_key + (self._generation,)
+
+        result = self.memory.get(key, default=ENOVAL, retry=True)
+        if result is not ENOVAL:
+            return result
+
+        with self._locks_guard:
+            lock = self._locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[key] = lock
+
+        with lock:
+            # Another thread may have compiled while we were waiting.
+            result = self.memory.get(key, default=ENOVAL, retry=True)
+            if result is not ENOVAL:
+                return result
+            # A failed compilation must not pollute the cache: only set the
+            # entry after the compiler returned successfully.
+            result = compiler(constraint, *args, **kwargs)
+            self.memory.set(key, result, retry=True)
+            return result
+
+
+@functools.lru_cache(1)
+def get_constraint_cache() -> ConstraintCache:
+    """Get the shared constraint compilation cache."""
+    return ConstraintCache()
