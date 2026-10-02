@@ -5,25 +5,26 @@ Use :func:`normalize_provider_exception` to convert a raw provider SDK exception
 into the appropriate Outlines type.
 """
 
+import importlib
 from collections.abc import Mapping
 from contextlib import contextmanager
 from functools import lru_cache
-import importlib
 from typing import Iterator
 
 __all__ = [
-    "OutlinesError",
-    "APIError",
-    "AuthenticationError",
-    "PermissionDeniedError",
-    "NotFoundError",
-    "RateLimitError",
-    "BadRequestError",
-    "ServerError",
-    "APITimeoutError",
     "APIConnectionError",
-    "ProviderResponseError",
+    "APIError",
+    "APITimeoutError",
+    "AuthenticationError",
+    "BadRequestError",
     "GenerationError",
+    "NotFoundError",
+    "OutlinesError",
+    "PermissionDeniedError",
+    "ProviderResponseError",
+    "RateLimitError",
+    "ServerError",
+    "StructuredGenerationError",
     "is_provider_exception",
     "normalize_provider_errors",
     "normalize_provider_exception",
@@ -165,6 +166,66 @@ class ProviderResponseError(APIError):
 class GenerationError(APIError):
     """Content filter hit, length stop, or refusal."""
     hint = "Output was refused, hit a content filter, reached the model's max-token limit, or similar."
+
+
+class StructuredGenerationError(GenerationError, ValueError):
+    """Structured output could not be produced/verified.
+
+    Raised when a model returns content that does not match the requested
+    structured output type (e.g. an invalid JSON document). Carries enough
+    information to pinpoint where generation went wrong:
+
+    Attributes
+    ----------
+    content : str | None
+        The complete raw content received from the model, if available.
+    verified_prefix_length : int
+        Length of the longest prefix of ``content`` that is still a valid
+        (possibly still-extendable) prefix of the expected structure.
+    failure_position : int | None
+        Position at which the output became invalid, or ``None`` when the
+        output ended while still incomplete (e.g. truncated JSON).
+    failure_location : str | None
+        Location of the failure within the structured value (e.g. a JSON
+        pointer such as ``"/items/0/name"`` for schema violations), or
+        ``None`` for syntax failures.
+    reason : str | None
+        Machine-friendly short description of the failure.
+    """
+
+    def __init__(
+        self,
+        message: str | None = None,
+        provider: str | None = None,
+        original_exception: Exception | None = None,
+        status_code: int | None = None,
+        request_id: str | None = None,
+        content: str | None = None,
+        verified_prefix_length: int = 0,
+        failure_position: int | None = None,
+        failure_location: str | None = None,
+        reason: str | None = None,
+    ):
+        if message is None:
+            message = (
+                "Structured generation failed: the output does not match the "
+                f"requested structured output type (verified prefix length: "
+                f"{verified_prefix_length}, failure position: {failure_position})."
+            )
+
+        super().__init__(
+            message,
+            provider=provider,
+            original_exception=original_exception,
+            status_code=status_code,
+            request_id=request_id,
+        )
+
+        self.content = content
+        self.verified_prefix_length = verified_prefix_length
+        self.failure_position = failure_position
+        self.failure_location = failure_location
+        self.reason = reason
 
 
 # ---------------------------------------------------------------------------
