@@ -137,7 +137,7 @@ def test_create_vocabulary_preserves_duplicate_token_ids():
             return " "
         return token
 
-    vocabulary = OutlinesCoreBackend.create_outlines_core_vocabulary(
+    vocabulary, _ = OutlinesCoreBackend.create_outlines_core_vocabulary(
         vocab=vocab,
         eos_token_id=0,
         eos_token="hello",
